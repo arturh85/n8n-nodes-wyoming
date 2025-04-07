@@ -14,6 +14,7 @@ import * as net from 'net';
 import * as path from 'path';
 import { spawn } from 'child_process'; // Import spawn for ffmpeg
 import { performance } from 'perf_hooks'; // Import for high-resolution timing
+import { WyomingCredentials } from '../../credentials/WyomingApi.credentials';
 
 // --- Constants ---
 const __version__ = '1.0.0'; // Wyoming protocol version compatibility
@@ -712,6 +713,12 @@ export class WyomingNode implements INodeType {
 		defaults: { name: 'Wyoming Node' },
 		inputs: ['main'],
 		outputs: ['main'],
+		credentials: [
+			{
+				name: 'wyomingApi',
+				required: true,
+			},
+		],
 		properties: [
 			{
 				displayName: 'Operation',
@@ -736,16 +743,16 @@ export class WyomingNode implements INodeType {
 				description: 'Choose whether to convert speech to text or text to speech',
 			},
 
-			// Common Properties
-			{
-				displayName: 'Wyoming Server Address',
-				name: 'wyomingServer',
-				type: 'string',
-				default: '127.0.0.1:10300', // Default Whisper port? Adjust if needed
-				placeholder: 'e.g., 192.168.1.100:10300',
-				description: 'Address (host:port) of your Wyoming Server (e.g., Whisper for STT, Piper for TTS)',
-				required: true,
-			},
+			// // Common Properties
+			// {
+			// 	displayName: 'Wyoming Server Address',
+			// 	name: 'wyomingServer',
+			// 	type: 'string',
+			// 	default: '127.0.0.1:10300', // Default Whisper port? Adjust if needed
+			// 	placeholder: 'e.g., 192.168.1.100:10300',
+			// 	description: 'Address (host:port) of your Wyoming Server (e.g., Whisper for STT, Piper for TTS)',
+			// 	required: true,
+			// },
 			{
 				displayName: 'Language',
 				name: 'language',
@@ -855,9 +862,11 @@ export class WyomingNode implements INodeType {
 
 			// --- Common Parameters ---
 			const operation = this.getNodeParameter('operation', itemIndex) as 'stt' | 'tts';
-			const serverAddress = this.getNodeParameter('wyomingServer', itemIndex) as string;
+			const credentials = await this.getCredentials('wyomingApi') as WyomingCredentials;
+			const serverAddress = `${credentials.host}:${credentials.port}`;
 			const timeoutMs = this.getNodeParameter('timeoutMs', itemIndex, 60000) as number;
 
+			logger.info(`${logPrefix} serverAddress: ${serverAddress}`);
 			logger.info(`${logPrefix} Starting operation: ${operation.toUpperCase()}`);
 
 			try {

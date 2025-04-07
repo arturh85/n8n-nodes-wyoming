@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-wyoming",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Wyoming is a peer-to-peer protocol for voice assistants (basically JSONL + PCM audio)",
   "keywords": [
     "n8n-community-node-package"
@@ -35,6 +35,9 @@
   ],
   "n8n": {
     "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/WyomingApi.credentials.js"
+    ],
     "nodes": [
       "dist/nodes/WyomingNode/WyomingNode.node.js"
     ]
