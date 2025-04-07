@@ -18,16 +18,21 @@ Follow the [installation guide](https://docs.n8n.io/integrations/community-nodes
 
 ## Operations
 
-- Transcribe Audio
+- Text to Speech (TTS)
+- Speech to Text (STT)
 
 ## Compatibility
 
-- Tested with Version 1.85.4
+- Tested with N8N Version 1.85.4 and [Piper TTS](https://github.com/rhasspy/wyoming-piper) and [Whisper STT](https://github.com/rhasspy/wyoming-faster-whisper/)
 
 ## Usage
 
-- Set the Wyoming Server URL and language
-- If the input is not in PCM format already conversion with [ffmpeg](https://ffmpeg.org/) is attempted.
+- Set the Wyoming Server URL 
+- For TTS:
+    - Set Voice
+- For SST: 
+    - Set Audio Language
+    - If the input is not in PCM format already conversion with [ffmpeg](https://ffmpeg.org/) is attempted.
 
 ## Resources
 
