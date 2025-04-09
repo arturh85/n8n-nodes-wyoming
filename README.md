@@ -1,6 +1,6 @@
 # n8n-nodes-wyoming
 
-This is an n8n community node. It lets you use [wyoming](https://github.com/rhasspy/wyoming) compatible servers for STT in your n8n workflows.
+This is an n8n community node. It lets you use [wyoming](https://github.com/rhasspy/wyoming) compatible servers for TTS & STT in your n8n workflows.
 
 Wyoming is a peer-to-peer protocol for voice assistants (basically JSONL + PCM audio)
 

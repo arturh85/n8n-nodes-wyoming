@@ -3,24 +3,22 @@ import type {
 	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
-	// Added for binary data handling
-	IBinaryData
+	IBinaryData,
 } from 'n8n-workflow';
 import  {
 	NodeOperationError,
 } from 'n8n-workflow';
-// Removed duplicate NodeOperationError import
 import * as net from 'net';
-import * as path from 'path';
-import { spawn } from 'child_process'; // Import spawn for ffmpeg
-import { performance } from 'perf_hooks'; // Import for high-resolution timing
+import { spawn } from 'child_process';
+import { performance } from 'perf_hooks';
 import { WyomingCredentials } from '../../credentials/WyomingApi.credentials';
 
 // --- Constants ---
-const __version__ = '1.0.0'; // Wyoming protocol version compatibility
+const __version__ = '1.0.0';
 const SAMPLE_RATE = 16000; // Target sample rate for Wyoming (STT input, TTS output likely)
 const SAMPLE_WIDTH = 2; // Target sample width (bytes) for Wyoming (16-bit) (STT input, TTS output likely)
 const SAMPLE_CHANNELS = 1; // Target channels for Wyoming (Mono) (STT input, TTS output likely)
+const AUDIO_CHUNK_SIZE = 64 * 1024; // 64 KiB chunks for sending audio
 const NODE_NAME_LOG_PREFIX = '[WyomingNode]';
 const NEWLINE = Buffer.from('\n', 'utf-8');
 const WYOMING_AUDIO_FORMAT_DESC = `PCM, ${SAMPLE_RATE / 1000}kHz sample rate, ${SAMPLE_WIDTH * 8}-bit depth, Mono channel`;
@@ -31,16 +29,22 @@ const AUDIO_CHUNK_EVENT_TYPE = 'audio-chunk';
 const AUDIO_STOP_EVENT_TYPE = 'audio-stop';
 const TRANSCRIPT_EVENT_TYPE = 'transcript';
 const ERROR_EVENT_TYPE = 'error';
-const DEFAULT_TTS_OUTPUT_MIME_TYPE = 'audio/wav'; // Output TTS as WAV for better compatibility
+const DEFAULT_TTS_OUTPUT_MIME_TYPE = 'audio/wav';
 
-// Utility to yield the event loop, useful for async operations in tight loops or socket handling
+// --- Utility Functions ---
+
 const yieldEventLoop = () => new Promise(resolve => setImmediate(resolve));
 
-// --- Standalone Helper Functions ---
+const _waitForDrain = (client: net.Socket, logPrefix: string): Promise<void> => {
+	return new Promise((resolve) => {
+		// logger.trace(`${logPrefix} Write buffer full. Waiting for drain event...`);
+		client.once('drain', () => {
+			// logger.trace(`${logPrefix} Drain event received. Resuming writes.`);
+			resolve();
+		});
+	});
+};
 
-/**
- * Creates a WAV header for raw PCM data.
- */
 function _addWavHeader(
 	pcmData: Buffer,
 	sampleRate: number,
@@ -51,45 +55,38 @@ function _addWavHeader(
 	const blockAlign = channels * sampleWidthBytes;
 	const byteRate = sampleRate * blockAlign;
 	const dataSize = pcmData.length;
-	const fileSize = 36 + dataSize; // 44 bytes total header size minus 8 bytes for RIFF id and size
+	const fileSize = 36 + dataSize;
 
 	const header = Buffer.alloc(44);
 
-	// RIFF chunk descriptor
 	header.write('RIFF', 0);
-	header.writeUInt32LE(fileSize, 4); // file-size (total size - 8 bytes)
+	header.writeUInt32LE(fileSize, 4);
 	header.write('WAVE', 8);
 
-	// fmt sub-chunk
 	header.write('fmt ', 12);
-	header.writeUInt32LE(16, 16); // Subchunk1Size (16 for PCM)
-	header.writeUInt16LE(1, 20);  // AudioFormat (1 for PCM)
+	header.writeUInt32LE(16, 16);
+	header.writeUInt16LE(1, 20);
 	header.writeUInt16LE(channels, 22);
 	header.writeUInt32LE(sampleRate, 24);
 	header.writeUInt32LE(byteRate, 28);
 	header.writeUInt16LE(blockAlign, 32);
 	header.writeUInt16LE(bitsPerSample, 34);
 
-	// data sub-chunk
 	header.write('data', 36);
 	header.writeUInt32LE(dataSize, 40);
 
 	return Buffer.concat([header, pcmData]);
 }
 
-
-/**
- * Sends a Wyoming event formatted according to wyoming/event.py protocol.
- */
 async function _sendWyomingEventRevised(
+	execContext: IExecuteFunctions, // Pass the full context
 	client: net.Socket,
 	eventType: string,
 	eventData: object | null,
 	payload: Buffer | null = null,
-	logger: IExecuteFunctions['logger'],
 	logPrefix: string
-): Promise<boolean> {
-	let overallSuccess = true;
+): Promise<void> {
+	const logger = execContext.logger; // Get logger from context
 	try {
 		const primaryJson: Record<string, any> = { type: eventType, version: __version__ };
 		let dataBytes: Buffer | null = null;
@@ -108,53 +105,44 @@ async function _sendWyomingEventRevised(
 		const primaryJsonString = JSON.stringify(primaryJson);
 		const primaryJsonBuffer = Buffer.from(primaryJsonString, 'utf-8');
 		logger.debug(`${logPrefix} Sending event: Type=${eventType}, DataLength=${primaryJson.data_length ?? 0}, PayloadLength=${primaryJson.payload_length ?? 0}`);
-		// logger.trace(`${logPrefix} Sending Primary JSON: ${primaryJsonString}`); // Optional deeper tracing
-		// if (dataBytes) logger.trace(`${logPrefix} Sending Data JSON: ${dataBytes.toString('utf-8')}`); // Optional
-		// if (payload) logger.trace(`${logPrefix} Sending Payload: ${payload.length} bytes`); // Optional
 
 		await yieldEventLoop();
-		let writeSuccess = client.write(primaryJsonBuffer);
-		writeSuccess &&= client.write(NEWLINE);
-		overallSuccess &&= writeSuccess;
+		if (!client.write(primaryJsonBuffer)) await _waitForDrain(client, logPrefix);
+		if (!client.write(NEWLINE)) await _waitForDrain(client, logPrefix);
 
 		if (dataBytes) {
-			const dataWriteSuccess = client.write(dataBytes);
-			if (!dataWriteSuccess && overallSuccess) logger.warn(`${logPrefix} Write buffer full after Data Bytes for ${eventType}.`);
-			overallSuccess &&= dataWriteSuccess;
+			if (!client.write(dataBytes)) await _waitForDrain(client, logPrefix);
 		}
 
 		if (payload) {
-			const payloadWriteSuccess = client.write(payload);
-			if (!payloadWriteSuccess && overallSuccess) logger.warn(`${logPrefix} Write buffer full after Payload Bytes for ${eventType}.`);
-			overallSuccess &&= payloadWriteSuccess;
+			if (!client.write(payload)) await _waitForDrain(client, logPrefix);
 		}
 
 	} catch (error: any) {
 		logger.error(`${logPrefix} Error during event construction/write for event ${eventType}: ${error.message}`, error);
 		await yieldEventLoop(); // Allow potential error handling on socket
-		return false; // Indicate failure
+		// Re-throw the error to be caught by the calling context (_handleWyomingCommunication)
+		// Use execContext.getNode() here
+		throw new NodeOperationError(execContext.getNode(), `Failed to send Wyoming event ${eventType}: ${error.message}`);
 	}
-	return overallSuccess;
 }
 
-/**
- * Common logic for handling Wyoming connection and event parsing.
- */
+
 async function _handleWyomingCommunication<T>(
 	execContext: IExecuteFunctions,
 	itemIndex: number,
 	serverAddress: string,
 	timeoutMs: number,
-	initialSendLogic: (client: net.Socket, logPrefix: string) => Promise<void>,
+	initialSendLogic: (execContext: IExecuteFunctions, client: net.Socket, logPrefix: string) => Promise<void>, // Pass context
 	processReceivedEvent: (
 		eventType: string,
 		eventData: Record<string, any> | null,
 		payload: Buffer | null,
-		state: { audioChunks: Buffer[], done: boolean, result?: T, error?: Error }, // Mutable state object
+		state: { audioChunks: Buffer[], done: boolean, result?: T, error?: Error },
 		logPrefix: string
 	) => Promise<void>,
 	getFinalResult: (state: { audioChunks: Buffer[], done: boolean, result?: T, error?: Error }) => T | Promise<T>,
-	operationType: 'STT' | 'TTS' // For logging
+	operationType: 'STT' | 'TTS'
 ): Promise<T> {
 	const logger = execContext.logger;
 	const logPrefix = `${NODE_NAME_LOG_PREFIX} Item ${itemIndex} (${operationType}):`;
@@ -170,7 +158,7 @@ async function _handleWyomingCommunication<T>(
 		} catch (error: any) {
 			logger.error(`${logPrefix} Error parsing server address: ${error.message}`);
 			const addrError = new NodeOperationError(execContext.getNode(), `Invalid Wyoming Server Address: ${error.message}`, { itemIndex });
-			(addrError as any).isConfigurationError = true; // Flag config error
+			(addrError as any).isConfigurationError = true;
 			return reject(addrError);
 		}
 
@@ -178,7 +166,6 @@ async function _handleWyomingCommunication<T>(
 		let receivedDataBuffer = Buffer.alloc(0);
 		let connectionClosed = false;
 		let appTimeoutHandle: NodeJS.Timeout | null = null;
-		// Mutable state to be passed to event processor
 		const processingState: { audioChunks: Buffer[], done: boolean, result?: T, error?: Error } = {
 			audioChunks: [],
 			done: false,
@@ -192,8 +179,8 @@ async function _handleWyomingCommunication<T>(
 					logger.debug(`${logPrefix} Cleaning up connection (${reason || 'normal close'}). State: ${client.readyState}`);
 					await yieldEventLoop();
 					client.removeAllListeners();
-					client.end(); // Graceful shutdown
-					client.destroySoon(); // Ensure it gets destroyed
+					client.end();
+					client.destroySoon();
 				}
 			}
 		};
@@ -202,125 +189,105 @@ async function _handleWyomingCommunication<T>(
 			const errorMsg = `Application timeout reached after ${timeoutMs}ms waiting for ${operationType} result`;
 			logger.warn(`${logPrefix} ${errorMsg}`);
 			await cleanup('application timeout');
-			if (!processingState.done && !connectionClosed) {
-				const timeoutError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
-				(timeoutError as any).isTimeout = true; // Flag timeout error
-				reject(timeoutError);
-			}
+			const timeoutError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
+			(timeoutError as any).isTimeout = true;
+			reject(timeoutError);
 		}, timeoutMs);
 
 		client.on('connect', async () => {
-			logger.info(`${logPrefix} TCP connection established with ${host}:${port}.`);
+			logger.debug(`${logPrefix} TCP connection established with ${host}:${port}.`);
 			await yieldEventLoop();
 			try {
-				await initialSendLogic(client, logPrefix);
+				// Pass execContext to initialSendLogic
+				await initialSendLogic(execContext, client, logPrefix);
 				logger.debug(`${logPrefix} Successfully sent initial request sequence.`);
 				await yieldEventLoop();
 			} catch (err: any) {
 				const errorMsg = `Error during initial data sending sequence: ${err.message}`;
 				logger.error(`${logPrefix} ${errorMsg}`, err);
 				await cleanup('write error sequence');
-				// Reject only if the timeout hasn't already fired or connection isn't closed
 				if (appTimeoutHandle && !connectionClosed) {
-				 reject(new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex })); // Don't flag specific type here
+					// Use the error directly if it's already a NodeOperationError
+					reject(err instanceof NodeOperationError ? err : new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex }));
 				}
 			}
 		});
 
 		client.on('data', async (chunk: Buffer) => {
 			receivedDataBuffer = Buffer.concat([receivedDataBuffer, chunk]);
-			// logger.trace(`${logPrefix} Received chunk: ${chunk.length} bytes. Total buffer: ${receivedDataBuffer.length} bytes.`);
 			await yieldEventLoop();
 
-			// Process all complete events in the buffer
 			while (true) {
-				// 1. Find the end of the primary JSON line
 				const newlineIndex = receivedDataBuffer.indexOf(NEWLINE);
 				if (newlineIndex === -1) {
-					// Not enough data for even the primary JSON line yet. Wait for more.
-					// logger.trace(`${logPrefix} Incomplete primary JSON line. Waiting for more data.`);
 					break;
 				}
 
-				// 2. Extract and parse the primary JSON
 				const primaryJsonBuffer = receivedDataBuffer.subarray(0, newlineIndex);
 				let eventDict: Record<string, any>;
 				try {
 					const primaryJsonString = primaryJsonBuffer.toString('utf-8');
-					// logger.trace(`${logPrefix} Attempting to parse primary JSON: ${primaryJsonString}`);
 					eventDict = JSON.parse(primaryJsonString);
+
+					const dataLength = eventDict['data_length'] as number | undefined ?? 0;
+					const payloadLength = eventDict['payload_length'] as number | undefined ?? 0;
+
+					const messageJsonLineLength = primaryJsonBuffer.length + NEWLINE.length;
+					const messageDataPayloadLength = dataLength + payloadLength;
+					const fullMessageLength = messageJsonLineLength + messageDataPayloadLength;
+
+					if (!processingState.done && receivedDataBuffer.length < fullMessageLength) {
+						break;
+					}
+
+					let dataDict: object | null = eventDict['data'] || null;
+					let dataBytes: Buffer | null = null;
+					if (dataLength > 0) {
+						const dataStart = messageJsonLineLength;
+						const dataEnd = dataStart + dataLength;
+						dataBytes = receivedDataBuffer.subarray(dataStart, dataEnd);
+						try {
+							const separateDataDict = JSON.parse(dataBytes.toString('utf-8'));
+							if (!dataDict) dataDict = {};
+							Object.assign(dataDict, separateDataDict);
+						} catch (parseError: any) {
+							logger.error(`${logPrefix} Failed to parse separate Data Bytes: ${dataBytes.toString('utf-8')}. Error: ${parseError.message}. Ignoring data part for this event.`);
+							dataDict = dataDict || {};
+						}
+					}
+
+					let payloadBytes: Buffer | null = null;
+					if (payloadLength > 0) {
+						const payloadStart = messageJsonLineLength + dataLength;
+						const payloadEnd = payloadStart + payloadLength;
+						payloadBytes = receivedDataBuffer.subarray(payloadStart, payloadEnd);
+					}
+
+					receivedDataBuffer = receivedDataBuffer.subarray(fullMessageLength);
+					await yieldEventLoop();
+
+					const eventType = eventDict['type'] as string;
+					// logger.debug(`${logPrefix} Rcvd & Parsed Complete Event: Type=${eventType}, DataKeys=${Object.keys(dataDict || {}).join(',') || 'None'}, PayloadLength=${payloadBytes?.length ?? 0}`);
+					await yieldEventLoop();
+
+					try {
+						await processReceivedEvent(eventType, dataDict, payloadBytes, processingState, logPrefix);
+					} catch (processorError: any) {
+						logger.error(`${logPrefix} Error processing received event type ${eventType}: ${processorError.message}`, processorError);
+						processingState.error = processorError instanceof NodeOperationError ? processorError : new NodeOperationError(execContext.getNode(), processorError.message || String(processorError), { itemIndex });
+						processingState.done = true;
+					}
+
 				} catch (parseError: any) {
 					logger.error(`${logPrefix} Failed to parse Primary JSON Line: "${primaryJsonBuffer.toString('utf-8')}". Error: ${parseError.message}. Discarding line.`);
-					// Consume the invalid line including the newline
+					processingState.error = new NodeOperationError(execContext.getNode(), "Invalid server response", { itemIndex });
+					processingState.done = true;
 					receivedDataBuffer = receivedDataBuffer.subarray(newlineIndex + NEWLINE.length);
 					await yieldEventLoop();
-					continue; // Try processing the rest of the buffer
 				}
 
-				// 3. Get data and payload lengths from the parsed primary JSON
-				const dataLength = eventDict['data_length'] as number | undefined ?? 0;
-				const payloadLength = eventDict['payload_length'] as number | undefined ?? 0;
-
-				// 4. Calculate the total length of the *entire* message (including JSON line, newline, data, payload)
-				const messageJsonLineLength = primaryJsonBuffer.length + NEWLINE.length;
-				const messageDataPayloadLength = dataLength + payloadLength;
-				const fullMessageLength = messageJsonLineLength + messageDataPayloadLength;
-
-				// 5. Check if the *entire* message is present in the buffer
-				if (receivedDataBuffer.length < fullMessageLength) {
-					// The full message (JSON + data + payload) hasn't arrived yet. Wait for more data.
-					// logger.trace(`${logPrefix} Incomplete event data/payload. Need ${fullMessageLength}, have ${receivedDataBuffer.length}. Waiting.`);
-					break;
-				}
-
-				// --- We now have the complete message in the buffer ---
-
-				// 6. Extract Data block (if present)
-				let dataDict: object | null = eventDict['data'] || null; // Data might be inline
-				let dataBytes: Buffer | null = null;
-				if (dataLength > 0) {
-					const dataStart = messageJsonLineLength;
-					const dataEnd = dataStart + dataLength;
-					dataBytes = receivedDataBuffer.subarray(dataStart, dataEnd);
-					try {
-						const separateDataDict = JSON.parse(dataBytes.toString('utf-8'));
-						if (!dataDict) dataDict = {};
-						Object.assign(dataDict, separateDataDict); // Merge inline and separate data
-					} catch (parseError: any) {
-						logger.error(`${logPrefix} Failed to parse separate Data Bytes: ${dataBytes.toString('utf-8')}. Error: ${parseError.message}. Ignoring data part for this event.`);
-						dataDict = dataDict || {}; // Keep potential inline data
-					}
-				}
-
-				// 7. Extract Payload block (if present)
-				let payloadBytes: Buffer | null = null;
-				if (payloadLength > 0) {
-					const payloadStart = messageJsonLineLength + dataLength;
-					const payloadEnd = payloadStart + payloadLength;
-					payloadBytes = receivedDataBuffer.subarray(payloadStart, payloadEnd);
-				}
-
-				// 8. Consume the *entire* processed message from the buffer
-				receivedDataBuffer = receivedDataBuffer.subarray(fullMessageLength);
-				await yieldEventLoop(); // Allow event loop turn after buffer modification
-
-				// 9. Process the received event
-				const eventType = eventDict['type'] as string;
-				// logger.info(`${logPrefix} Rcvd & Parsed Complete Event: Type=${eventType}, Data=${JSON.stringify(dataDict)}, PayloadLength=${payloadBytes?.length ?? 0}`);
-				await yieldEventLoop();
-
-				try {
-					// Pass the extracted data and payload to the specific handler
-					await processReceivedEvent(eventType, dataDict, payloadBytes, processingState, logPrefix);
-				} catch (processorError: any) {
-					logger.error(`${logPrefix} Error processing received event type ${eventType}: ${processorError.message}`, processorError);
-					processingState.error = processorError instanceof NodeOperationError ? processorError : new NodeOperationError(execContext.getNode(), processorError.message || String(processorError), { itemIndex });
-					processingState.done = true; // Mark as done due to error
-				}
-
-				// 10. Check if the operation is complete (success or error)
 				if (processingState.done) {
-					logger.debug(`${logPrefix} Operation marked as done. Cleaning up.`);
+					logger.info(`${logPrefix} Operation marked as done. Cleaning up.`);
 					await cleanup(processingState.error ? 'error processing event' : 'operation complete');
 					if (processingState.error) {
 						reject(processingState.error);
@@ -334,71 +301,58 @@ async function _handleWyomingCommunication<T>(
 							reject(resultError instanceof NodeOperationError ? resultError : new NodeOperationError(execContext.getNode(), resultError.message || String(resultError), { itemIndex }));
 						}
 					}
-					return; // Exit the 'data' handler completely
+					return;
 				}
 
-				// If buffer is empty after processing, break the inner loop, otherwise continue processing
 				if (receivedDataBuffer.length === 0) {
-					// logger.trace(`${logPrefix} Buffer empty after processing event. Waiting for more data.`);
 					break;
-				} else {
-					// logger.trace(`${logPrefix} ${receivedDataBuffer.length} bytes remaining in buffer. Checking for next event.`);
 				}
-
-			} // End while(true) loop for processing buffer
-		}); // End client.on('data')
+			}
+		});
 
 		client.on('end', async () => {
 			await cleanup('server ended connection');
-			// Reject only if the operation wasn't already completed/timed out/closed
 			if (!processingState.done && appTimeoutHandle && !connectionClosed) {
 				const errorMsg = `Connection closed by server before ${operationType} completed.`;
 				logger.warn(`${logPrefix} ${errorMsg}`);
 				const closeError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
-				(closeError as any).isConnectionClosed = true; // Flag premature close
+				(closeError as any).isConnectionClosed = true;
 				reject(closeError);
 			}
 		});
 
 		client.on('close', async (hadError: boolean) => {
 			const cleanupReason = `closed${hadError ? ' with error' : ''}`;
-			const shouldReject = !processingState.done && appTimeoutHandle && !connectionClosed; // Check if rejection is still relevant
-			await cleanup(cleanupReason); // Ensure cleanup happens
+			const shouldReject = !processingState.done && appTimeoutHandle && !connectionClosed;
+			await cleanup(cleanupReason);
 			if (shouldReject) {
 				 const errorMsg = `Connection closed unexpectedly${hadError ? ' with error' : ''}.`;
 				 logger.warn(`${logPrefix} ${errorMsg}`);
 				 const closeError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
-				 (closeError as any).isConnectionClosed = true; // Flag premature close
+				 (closeError as any).isConnectionClosed = true;
 				 reject(closeError);
 			 }
 		});
 
-		client.on('error', async (err: Error & { code?: string }) => { // Add code type hint
+		client.on('error', async (err: Error & { code?: string }) => {
 			const code = err.code;
 			let errorMsg = `Socket error: ${err.message}`;
 			if (code) errorMsg += ` (Code: ${code})`;
 			logger.error(`${logPrefix} ${errorMsg}`, err);
-			const shouldReject = !processingState.done && appTimeoutHandle && !connectionClosed; // Check if rejection is still relevant
-			await cleanup('socket error'); // Ensure cleanup happens
+			const shouldReject = !processingState.done && appTimeoutHandle && !connectionClosed;
+			await cleanup('socket error');
 			if (shouldReject) {
 				const nodeError = new NodeOperationError(execContext.getNode(), errorMsg, { itemIndex });
-				(nodeError as any).originalCode = code; // Preserve original code
+				(nodeError as any).originalCode = code;
 				if (code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'EHOSTUNREACH') {
-					(nodeError as any).isConfigurationError = true; // Likely bad address/port or server down
+					(nodeError as any).isConfigurationError = true;
 				}
 				reject(nodeError);
 			}
 		});
 
-		// Optional: Handle socket timeout if the server library uses it
-		// client.on('timeout', async () => {
-		//  logger.warn(`${logPrefix} Socket inactivity timeout triggered.`);
-		//  await cleanup('socket inactivity timeout');
-		//  // Optional: reject if needed and not already done
-		// });
-
-		// Drain event indicates the write buffer is empty again
 		client.on('drain', async () => {
+			// Drain event is handled internally by _sendWyomingEventRevised using _waitForDrain
 			// logger.trace(`${logPrefix} Socket write buffer drained.`);
 			await yieldEventLoop();
 		});
@@ -409,32 +363,42 @@ async function _handleWyomingCommunication<T>(
 	});
 }
 
-/**
- * Handles the audio transcription process (STT).
- */
+const toTitleCase = (input: string | null | undefined): string | null => {
+    if (!input) return null;
+    return input.match(/[A-Z]{2,}(?=[A-Z][a-z]+[0-9]*|\b)|[A-Z]?[a-z]+[0-9]*|[A-Z]|[0-9]+/g)
+        ?.map((x) => x.slice(0, 1).toUpperCase() + x.slice(1).toLowerCase()) // Ensure correct casing
+        .join(' ') || input; // Return original if regex fails
+}
+
 async function _transcribeAudio(
 	execContext: IExecuteFunctions,
 	itemIndex: number,
 	serverAddress: string,
-	audioBuffer: Buffer, // Already converted PCM buffer
+	audioBuffer: Buffer,
 	language: string,
 	timeoutMs: number,
 ): Promise<string> {
 
-	const initialSendLogic = async (client: net.Socket, logPrefix: string) => {
-		let overallWriteSuccess = true;
-		overallWriteSuccess &&= await _sendWyomingEventRevised(client, TRANSCRIBE_EVENT_TYPE, { language }, null, execContext.logger, logPrefix);
-		overallWriteSuccess &&= await _sendWyomingEventRevised(client, AUDIO_START_EVENT_TYPE, { rate: SAMPLE_RATE, width: SAMPLE_WIDTH, channels: SAMPLE_CHANNELS }, null, execContext.logger, logPrefix);
-		// Send audio in chunks if it's very large? For now, send all at once.
-		overallWriteSuccess &&= await _sendWyomingEventRevised(client, AUDIO_CHUNK_EVENT_TYPE, { rate: SAMPLE_RATE, width: SAMPLE_WIDTH, channels: SAMPLE_CHANNELS }, audioBuffer, execContext.logger, logPrefix);
-		overallWriteSuccess &&= await _sendWyomingEventRevised(client, AUDIO_STOP_EVENT_TYPE, {}, null, execContext.logger, logPrefix);
-		if (!overallWriteSuccess) execContext.logger.warn(`${logPrefix} Completed sending STT sequence, but kernel buffer reported full at some point.`);
+	// Update signature to accept execContext
+	const initialSendLogic = async (execCtx: IExecuteFunctions, client: net.Socket, logPrefix: string) => {
+		await _sendWyomingEventRevised(execCtx, client, TRANSCRIBE_EVENT_TYPE, { language }, null, logPrefix);
+		await _sendWyomingEventRevised(execCtx, client, AUDIO_START_EVENT_TYPE, { rate: SAMPLE_RATE, width: SAMPLE_WIDTH, channels: SAMPLE_CHANNELS }, null, logPrefix);
+
+		execCtx.logger.debug(`${logPrefix} Sending audio data in chunks (${AUDIO_CHUNK_SIZE} bytes each)...`);
+		for (let i = 0; i < audioBuffer.length; i += AUDIO_CHUNK_SIZE) {
+			const chunk = audioBuffer.subarray(i, Math.min(i + AUDIO_CHUNK_SIZE, audioBuffer.length));
+			// execCtx.logger.trace(`${logPrefix} Sending audio chunk: ${chunk.length} bytes.`);
+			await _sendWyomingEventRevised(execCtx, client, AUDIO_CHUNK_EVENT_TYPE, { rate: SAMPLE_RATE, width: SAMPLE_WIDTH, channels: SAMPLE_CHANNELS }, chunk, logPrefix);
+		}
+		execCtx.logger.debug(`${logPrefix} Finished sending audio chunks.`);
+
+		await _sendWyomingEventRevised(execCtx, client, AUDIO_STOP_EVENT_TYPE, {}, null, logPrefix);
 	};
 
 	const processReceivedEvent = async (
 		eventType: string,
 		eventData: Record<string, any> | null,
-		_payload: Buffer | null, // Payload not expected for transcript/error
+		_payload: Buffer | null,
 		state: { audioChunks: Buffer[], done: boolean, result?: string, error?: Error },
 		logPrefix: string
 	) => {
@@ -444,10 +408,17 @@ async function _transcribeAudio(
 			state.result = transcription;
 			state.done = true;
 		} else if (eventType === ERROR_EVENT_TYPE) {
-			const errMsg = eventData?.message || 'Unknown server error during transcription';
+			const codeStr = toTitleCase(eventData?.code);
+			const textStr = eventData?.text;
+			let errMsg = eventData?.message || 'Unknown server error during transcription';
+			if (codeStr && textStr) {
+				errMsg = `${codeStr}: ${textStr}`;
+			} else if (codeStr) {
+				errMsg = codeStr;
+			}
 			execContext.logger.error(`${logPrefix} Received error event from server: ${errMsg}`);
 			const serverError = new NodeOperationError(execContext.getNode(), `Wyoming server error (STT): ${errMsg}`, { itemIndex });
-			(serverError as any).isServerError = true; // Flag server-reported error
+			(serverError as any).isServerError = true;
 			state.error = serverError;
 			state.done = true;
 		} else {
@@ -459,7 +430,6 @@ async function _transcribeAudio(
 		if (state.result !== undefined) {
 			return state.result;
 		}
-		// This should ideally not be reached if 'done' is true without a result or error
 		throw new NodeOperationError(execContext.getNode(), 'Transcription finished unexpectedly without result or error.', { itemIndex });
 	};
 
@@ -475,68 +445,59 @@ async function _transcribeAudio(
 	);
 }
 
-/**
- * Handles the audio synthesis process (TTS).
- */
 async function _synthesizeAudio(
 	execContext: IExecuteFunctions,
 	itemIndex: number,
 	serverAddress: string,
 	textToSpeak: string,
-	voiceName: string | undefined, // Allow undefined
+	voiceName: string | undefined,
 	timeoutMs: number,
 ): Promise<Buffer> { // Returns raw PCM buffer
 
-	const initialSendLogic = async (client: net.Socket, logPrefix: string) => {
+	// Update signature to accept execContext
+	const initialSendLogic = async (execCtx: IExecuteFunctions, client: net.Socket, logPrefix: string) => {
 		const synthesizeData: Record<string, any> = { text: textToSpeak };
-		// Construct voice object based on provided parameters
-		// Prioritize voice name if given
 		if (voiceName) {
 			synthesizeData.voice = { name: voiceName };
-			// Note: Wyoming spec allows speaker within name, but keeping it simple here.
-			// If Piper needs speaker ID separate, adjust this structure:
-			// synthesizeData.voice = { name: 'some-voice-model', speaker: voiceName };
 		}
-		// If neither voice nor language is provided, don't include the voice field
-        // and let the server use its default.
-
-		const success = await _sendWyomingEventRevised(client, SYNTHESIZE_EVENT_TYPE, synthesizeData, null, execContext.logger, logPrefix);
-		if (!success) {
-			// Throw an error to be caught in the connect handler of _handleWyomingCommunication
-			throw new NodeOperationError(execContext.getNode(), "Failed to send synthesize event (write buffer likely full immediately).");
-		}
+		// If no voiceName, the server uses its default.
+		await _sendWyomingEventRevised(execCtx, client, SYNTHESIZE_EVENT_TYPE, synthesizeData, null, logPrefix);
 	};
 
 	const processReceivedEvent = async (
 		eventType: string,
 		eventData: Record<string, any> | null,
 		payload: Buffer | null,
-		state: { audioChunks: Buffer[], done: boolean, result?: Buffer, error?: Error }, // result is not used here, audioChunks holds the data
+		state: { audioChunks: Buffer[], done: boolean, result?: Buffer, error?: Error },
 		logPrefix: string
 	) => {
 		if (eventType === AUDIO_START_EVENT_TYPE) {
-			// Optional: Log or verify the received audio format
 			const rate = eventData?.rate ?? 'unknown';
 			const width = eventData?.width ?? 'unknown';
 			const channels = eventData?.channels ?? 'unknown';
 			execContext.logger.info(`${logPrefix} Received audio-start. Format: ${rate} Hz, ${width} bytes/sample, ${channels} channel(s).`);
 			if (rate !== SAMPLE_RATE || width !== SAMPLE_WIDTH || channels !== SAMPLE_CHANNELS) {
-				execContext.logger.warn(`${logPrefix} Received audio format differs from node defaults. Using received format for WAV header.`);
-				// Store format if needed later, but WAV header currently uses constants
+				execContext.logger.warn(`${logPrefix} Received audio format differs from node defaults. Using node defaults for WAV header.`);
 			}
-			state.audioChunks = []; // Reset chunks on new start
+			state.audioChunks = [];
 		} else if (eventType === AUDIO_CHUNK_EVENT_TYPE) {
 			if (payload) {
-				// execContext.logger.trace(`${logPrefix} Received audio chunk: ${payload.length} bytes.`);
 				state.audioChunks.push(payload);
 			} else {
 				execContext.logger.warn(`${logPrefix} Received audio-chunk event with no payload.`);
 			}
 		} else if (eventType === AUDIO_STOP_EVENT_TYPE) {
 			execContext.logger.info(`${logPrefix} Received audio-stop. Synthesis complete.`);
-			state.done = true; // Mark as done, result will be assembled in getFinalResult
+			state.done = true;
 		} else if (eventType === ERROR_EVENT_TYPE) {
-			const errMsg = eventData?.message || 'Unknown server error during synthesis';
+			const codeStr = toTitleCase(eventData?.code);
+			const textStr = eventData?.text;
+			let errMsg = eventData?.message || 'Unknown server error during synthesis';
+			if (codeStr && textStr) {
+				errMsg = `${codeStr}: ${textStr}`;
+			} else if (codeStr) {
+				errMsg = codeStr;
+			}
 			execContext.logger.error(`${logPrefix} Received error event from server: ${errMsg}`);
 			const serverError = new NodeOperationError(execContext.getNode(), `Wyoming server error (TTS): ${errMsg}`, { itemIndex });
 			(serverError as any).isServerError = true;
@@ -551,12 +512,10 @@ async function _synthesizeAudio(
 		if (state.audioChunks.length > 0) {
 			return Buffer.concat(state.audioChunks);
 		} else if (state.error) {
-            // Should have been rejected already, but handle defensively
             throw state.error;
         } else {
-			// We got audio-stop but no chunks, or finished some other way without error/chunks
-			execContext.logger.warn(`[WyomingNode] Synthesis finished but no audio data was received.`);
-			return Buffer.alloc(0); // Return empty buffer
+			execContext.logger.warn(`[WyomingNode] TTS Synthesis finished but no audio data was received.`);
+			return Buffer.alloc(0);
 		}
 	};
 
@@ -572,14 +531,9 @@ async function _synthesizeAudio(
 	);
 }
 
-
-/**
- * Converts audio buffer to the target PCM format (s16le, 16kHz, mono) using ffmpeg.
- * Adds flags to rejected errors for specific failure types. (Used only for STT)
- */
 async function convertAudioToPcm(
 	inputBuffer: Buffer,
-	_inputFileNameHint: string | undefined, // Keep signature, but might not use hint
+	_inputFileNameHint: string | undefined,
 	targetSampleRate: number,
 	targetChannels: number,
 	logger: IExecuteFunctions['logger'],
@@ -587,14 +541,14 @@ async function convertAudioToPcm(
 ): Promise<Buffer> {
 
 	const ffmpegArgs = [
-		'-loglevel', 'error', // Only output errors
-		'-i', 'pipe:0',        // Input from stdin
-		'-f', 's16le',         // Output format: signed 16-bit little-endian PCM
-		'-ar', String(targetSampleRate), // Output sample rate
-		'-ac', String(targetChannels),  // Output channels (mono)
-		'-',                   // Output to stdout
+		'-loglevel', 'error',
+		'-i', 'pipe:0',
+		'-f', 's16le',
+		'-ar', String(targetSampleRate),
+		'-ac', String(targetChannels),
+		'-',
 	];
-	logger.info(`${logPrefix} Starting audio conversion with ffmpeg. Target: ${targetSampleRate}Hz, ${targetChannels === 1 ? 'Mono' : 'Stereo'}.`);
+	logger.info(`${logPrefix} Starting audio conversion with ffmpeg. Target: ${targetSampleRate}Hz, ${targetChannels === 1 ? 'Mono' : 'Stereo'} ${SAMPLE_WIDTH * 8}-bit PCM.`);
 	logger.debug(`${logPrefix} Running ffmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`);
 
 	return new Promise<Buffer>((resolve, reject) => {
@@ -602,17 +556,14 @@ async function convertAudioToPcm(
 		const outputChunks: Buffer[] = [];
 		const errorChunks: Buffer[] = [];
 
-		// Handle stdout
 		ffmpegProcess.stdout.on('data', (chunk: Buffer) => {
 			outputChunks.push(chunk);
 		});
 
-		// Handle stderr
 		ffmpegProcess.stderr.on('data', (chunk: Buffer) => {
 			errorChunks.push(chunk);
 		});
 
-		// Handle process exit
 		ffmpegProcess.on('close', (code) => {
 			const stderrOutput = Buffer.concat(errorChunks).toString('utf-8').trim();
 			if (code !== 0) {
@@ -620,18 +571,18 @@ async function convertAudioToPcm(
 				if (stderrOutput) logger.error(`${logPrefix} ffmpeg stderr: ${stderrOutput}`);
 				else logger.error(`${logPrefix} ffmpeg stderr: (empty)`);
 
-				// Try to provide a more specific error message
 				let userMessage = `ffmpeg conversion failed (exit code ${code})`;
 				if (stderrOutput.includes('Invalid data found when processing input')) {
 					userMessage += ': Input audio data seems invalid or corrupted.';
 				} else if (stderrOutput.includes('Output file #0 does not contain any stream')) {
 					userMessage += ': ffmpeg could not produce output, possibly due to input format issues or invalid parameters.';
 				} else if (stderrOutput) {
-					userMessage += `: ${stderrOutput}`;
+					// Only append stderr if it's not excessively long
+					userMessage += `: ${stderrOutput.substring(0, 200)}${stderrOutput.length > 200 ? '...' : ''}`;
 				}
 
 				const ffmpegError = new Error(userMessage);
-				(ffmpegError as any).isFFmpegError = true; // Flag ffmpeg execution error
+				(ffmpegError as any).isFFmpegError = true;
 				reject(ffmpegError);
 			} else {
 				const pcmBuffer = Buffer.concat(outputChunks);
@@ -639,14 +590,8 @@ async function convertAudioToPcm(
 					logger.error(`${logPrefix} ffmpeg conversion succeeded (code 0) but produced empty output.`);
 					if (stderrOutput) logger.warn(`${logPrefix} ffmpeg stderr (may contain clues): ${stderrOutput}`);
 					const ffmpegError = new Error('ffmpeg conversion produced empty output.');
-					(ffmpegError as any).isFFmpegError = true; // Flag empty output as ffmpeg related
+					(ffmpegError as any).isFFmpegError = true;
 					reject(ffmpegError);
-				} else if (pcmBuffer.length % SAMPLE_WIDTH !== 0) {
-                    logger.warn(`${logPrefix} Converted PCM buffer length (${pcmBuffer.length} bytes) is not a multiple of sample width (${SAMPLE_WIDTH}). This might indicate an issue.`);
-                    if (stderrOutput) logger.warn(`${logPrefix} ffmpeg stderr: ${stderrOutput}`);
-					logger.info(`${logPrefix} ffmpeg conversion successful despite odd length. Resulting PCM buffer size: ${pcmBuffer.length} bytes.`);
-					if (stderrOutput) logger.warn(`${logPrefix} ffmpeg stderr (possibly warnings): ${stderrOutput}`);
-					resolve(pcmBuffer);
 				} else {
 					logger.info(`${logPrefix} ffmpeg conversion successful. Resulting PCM buffer size: ${pcmBuffer.length} bytes.`);
 					if (stderrOutput) logger.warn(`${logPrefix} ffmpeg stderr (possibly warnings): ${stderrOutput}`);
@@ -655,29 +600,24 @@ async function convertAudioToPcm(
 			}
 		});
 
-		// Handle spawn errors (e.g., ffmpeg not found)
 		ffmpegProcess.on('error', (err) => {
 			logger.error(`${logPrefix} Failed to start ffmpeg process: ${err.message}`);
 			const spawnError = new Error(`Failed to spawn ffmpeg: ${err.message}. Is ffmpeg installed and in PATH?`);
-			(spawnError as any).isSpawnError = true; // Flag spawn error
+			(spawnError as any).isSpawnError = true;
 			reject(spawnError);
 		});
 
-		// Handle errors writing to stdin (e.g., process already closed)
 		ffmpegProcess.stdin.on('error', (err: NodeJS.ErrnoException) => {
-			// Ignore EPIPE errors, which happen if ffmpeg closes stdin before we finish writing (e.g., due to an input error)
 			if (err.code !== 'EPIPE') {
 				logger.warn(`${logPrefix} Error writing to ffmpeg stdin (process might have exited): ${err.message} (${err.code})`);
 			}
 		});
 
-		// Write the input buffer to ffmpeg's stdin
 		try {
 			ffmpegProcess.stdin.write(inputBuffer, (err) => {
 				if (err && !ffmpegProcess.killed && (err as NodeJS.ErrnoException).code !== 'EPIPE') {
 					logger.warn(`${logPrefix} Error writing buffer chunk to ffmpeg stdin: ${err.message}.`);
 				}
-				// Close stdin after writing is complete (or errored)
 				if (!ffmpegProcess.stdin.destroyed) {
 					ffmpegProcess.stdin.end((endErr: Error | null | undefined) => {
 						if (endErr && !ffmpegProcess.killed && (endErr as NodeJS.ErrnoException).code !== 'EPIPE') {
@@ -687,13 +627,12 @@ async function convertAudioToPcm(
 				}
 			});
 		} catch (error: any) {
-			// Catch synchronous errors, though less likely here
 			logger.error(`${logPrefix} Exception while initiating write to ffmpeg stdin: ${error.message}`);
 			const stdinError = new Error(`Failed writing input to ffmpeg: ${error.message}`);
-			(stdinError as any).isStdinError = true; // Flag stdin error
+			(stdinError as any).isStdinError = true;
 			reject(stdinError);
 			if (!ffmpegProcess.killed) {
-				ffmpegProcess.kill(); // Ensure cleanup
+				ffmpegProcess.kill();
 			}
 		}
 	});
@@ -708,7 +647,7 @@ export class WyomingNode implements INodeType {
 		name: 'wyomingNode',
 		icon: 'file:transcribe.svg',
 		group: ['transform'],
-		version: 2,
+		version: 2, // Updated version due to significant changes (backpressure handling)
 		description: `Performs Speech-to-Text (STT) or Text-to-Speech (TTS) using the Wyoming protocol. Connects to servers like Piper (TTS) or Whisper (STT). Requires 'ffmpeg' for STT audio conversion. STT Input: Various formats (MP3, WAV, Ogg, etc.). STT Output: Text. TTS Input: Text. TTS Output: WAV Audio (${WYOMING_AUDIO_FORMAT_DESC} internally).`,
 		defaults: { name: 'Wyoming Node' },
 		inputs: ['main'],
@@ -742,17 +681,6 @@ export class WyomingNode implements INodeType {
 				default: 'tts',
 				description: 'Choose whether to convert speech to text or text to speech',
 			},
-
-			// // Common Properties
-			// {
-			// 	displayName: 'Wyoming Server Address',
-			// 	name: 'wyomingServer',
-			// 	type: 'string',
-			// 	default: '127.0.0.1:10300', // Default Whisper port? Adjust if needed
-			// 	placeholder: 'e.g., 192.168.1.100:10300',
-			// 	description: 'Address (host:port) of your Wyoming Server (e.g., Whisper for STT, Piper for TTS)',
-			// 	required: true,
-			// },
 			{
 				displayName: 'Language',
 				name: 'language',
@@ -764,7 +692,8 @@ export class WyomingNode implements INodeType {
 						operation: ['stt'],
 					},
 				},
-				description: 'Language code (e.g., ISO 639-1 or IETF). Specifies transcription language. Check server documentation for supported codes/formats.',
+				description: 'Language code (e.g., ISO 639-1 or IETF) for STT. Check server documentation for supported codes/formats. Required for STT.',
+				required: true, // Made required when STT is selected
 			},
 			{
 				displayName: 'Timeout (Ms)',
@@ -775,8 +704,6 @@ export class WyomingNode implements INodeType {
 				description: 'Maximum time (milliseconds) to wait for the entire operation (connection, processing, response)',
 				required: true,
 			},
-
-			// --- STT Specific Properties ---
 			{
 				displayName: 'Input Binary Field (Audio)',
 				name: 'inputBinaryField',
@@ -793,9 +720,9 @@ export class WyomingNode implements INodeType {
 			},
 			{
 				displayName: 'Output Field Name (Text)',
-				name: 'outputFieldNameStt', // Changed name to avoid conflict
+				name: 'outputFieldNameStt',
 				type: 'string',
-				default: 'transcription', // More specific default
+				default: 'transcription',
 				required: true,
 				displayOptions: {
 					show: {
@@ -804,10 +731,8 @@ export class WyomingNode implements INodeType {
 				},
 				description: 'Field name where the resulting transcribed text will be stored',
 			},
-
-			// --- TTS Specific Properties ---
 			{
-				displayName: 'Input Text',
+				displayName: 'Input Text Field',
 				name: 'inputText',
 				type: 'string',
 				default: '',
@@ -817,8 +742,8 @@ export class WyomingNode implements INodeType {
 						operation: ['tts'],
 					},
 				},
-				placeholder: 'e.g., message',
-				description: 'Text to be synthesized into speech',
+				placeholder: 'Enter text or e.g. {{$json.message}}',
+				description: 'Text to be synthesized into speech. Can use expressions.',
 			},
 			{
 				displayName: 'Voice Name/ID',
@@ -831,12 +756,12 @@ export class WyomingNode implements INodeType {
 						operation: ['tts'],
 					},
 				},
-				placeholder: 'e.g., en_US-lessac-medium or specific speaker ID',
-				description: 'Name or ID of the voice to use for TTS. If omitted, the server\'s default or a voice matching the Language might be used. Check your TTS server (e.g., Piper) documentation for available voices.',
+				placeholder: 'e.g., en_US-lessac-medium (Optional)',
+				description: '(Optional) Name or ID of the voice for TTS. Leave empty to use the server\'s default. Check your TTS server (e.g., Piper) documentation.',
 			},
 			{
 				displayName: 'Output Field Name (Audio)',
-				name: 'outputFieldName',
+				name: 'outputFieldNameTts',
 				type: 'string',
 				default: 'audio',
 				required: true,
@@ -860,23 +785,20 @@ export class WyomingNode implements INodeType {
 			const logPrefix = `${NODE_NAME_LOG_PREFIX} Item ${itemIndex}:`;
 			const overallStartTime = performance.now();
 
-			// --- Common Parameters ---
 			const operation = this.getNodeParameter('operation', itemIndex) as 'stt' | 'tts';
 			const credentials = await this.getCredentials('wyomingApi') as WyomingCredentials;
 			const serverAddress = `${credentials.host}:${credentials.port}`;
 			const timeoutMs = this.getNodeParameter('timeoutMs', itemIndex, 60000) as number;
-
-			logger.info(`${logPrefix} serverAddress: ${serverAddress}`);
-			logger.info(`${logPrefix} Starting operation: ${operation.toUpperCase()}`);
-
 			try {
-				let newItem: INodeExecutionData | null = null; // Initialize as null
+				let newItem: INodeExecutionData | null = null;
 
-				// --- STT Execution Path ---
 				if (operation === 'stt') {
-					const language = this.getNodeParameter('language', itemIndex, undefined) as string | undefined; // Allow undefined
+					const language = this.getNodeParameter('language', itemIndex) as string; // Required for STT now
 					const inputBinaryField = this.getNodeParameter('inputBinaryField', itemIndex) as string;
-					const outputFieldName = this.getNodeParameter('outputFieldNameStt', itemIndex) as string; // Use STT output field
+					const outputFieldName = this.getNodeParameter('outputFieldNameStt', itemIndex) as string;
+
+					// Language validation happens implicitly as it's required
+					// No need for !language check if required: true is set
 
 					const binaryData = item.binary?.[inputBinaryField];
 					if (!binaryData) throw new NodeOperationError(this.getNode(), `STT: No binary data found in input field "${inputBinaryField}".`, { itemIndex });
@@ -884,18 +806,15 @@ export class WyomingNode implements INodeType {
 					const inputAudioBuffer = await this.helpers.getBinaryDataBuffer(itemIndex, inputBinaryField);
 					if (!inputAudioBuffer || inputAudioBuffer.length === 0) throw new NodeOperationError(this.getNode(), `STT: Binary data in input field "${inputBinaryField}" is present but empty.`, { itemIndex });
 
-					const mimeType = binaryData.mimeType?.toLowerCase();
 					const fileName = binaryData.fileName;
-					const fileExtension = fileName ? path.extname(fileName).toLowerCase() : '';
-					logger.debug(`${logPrefix} STT Input Info: Filename='${fileName || 'N/A'}', MIME type='${mimeType || 'N/A'}', Extension='${fileExtension || 'N/A'}'`);
+					logger.debug(`${logPrefix} STT Input Info: Filename='${fileName || 'N/A'}', Size=${inputAudioBuffer.length} bytes`);
 
-					// --- FFmpeg Conversion (STT Only) ---
 					let pcmBufferToSend: Buffer;
 					let conversionDurationMs = 0;
-					// Always convert for STT to ensure correct format
-					logger.info(`${logPrefix} STT: Preparing audio using ffmpeg conversion to ${WYOMING_AUDIO_FORMAT_DESC}.`);
+					logger.debug(`${logPrefix} STT: Preparing audio using ffmpeg conversion to ${WYOMING_AUDIO_FORMAT_DESC}.`);
 					try {
 						const conversionStartTime = performance.now();
+						// Pass logger directly, it doesn't need the full context
 						pcmBufferToSend = await convertAudioToPcm(inputAudioBuffer, fileName, SAMPLE_RATE, SAMPLE_CHANNELS, logger, logPrefix);
 						const conversionEndTime = performance.now();
 						conversionDurationMs = conversionEndTime - conversionStartTime;
@@ -911,20 +830,16 @@ export class WyomingNode implements INodeType {
 						throw new NodeOperationError(this.getNode(), 'STT: Audio conversion resulted in an empty buffer.', { itemIndex });
 					}
 
-					// --- Wyoming Transcription ---
 					let transcriptionDurationMs = 0;
-					logger.debug(`${logPrefix} STT: Starting transcription process.`);
+					logger.debug(`${logPrefix} STT: Starting transcription process. Language: ${language}`);
 					const transcriptionStartTime = performance.now();
-					// Ensure language is provided for STT, default to 'en' if undefined
-					const sttLanguage = language || 'en';
-					logger.debug(`${logPrefix} STT: Using language code: ${sttLanguage}`);
-					const transcription = await _transcribeAudio(this, itemIndex, serverAddress, pcmBufferToSend, sttLanguage, timeoutMs);
+					// Pass `this` (IExecuteFunctions) as execContext
+					const transcription = await _transcribeAudio(this, itemIndex, serverAddress, pcmBufferToSend, language, timeoutMs);
 					const transcriptionEndTime = performance.now();
 					transcriptionDurationMs = transcriptionEndTime - transcriptionStartTime;
 					logger.info(`${logPrefix} STT: Wyoming transcription took ${transcriptionDurationMs.toFixed(2)} ms.`);
 
-					// --- Prepare STT Output ---
-					const newItemJson = JSON.parse(JSON.stringify(item.json)); // Deep copy
+					const newItemJson = JSON.parse(JSON.stringify(item.json));
 					newItemJson[outputFieldName] = transcription;
 					newItem = { json: newItemJson, pairedItem: { item: itemIndex } };
 
@@ -932,43 +847,39 @@ export class WyomingNode implements INodeType {
 					logger.info(`${logPrefix} STT: Successfully processed item in ${(overallEndTime - overallStartTime).toFixed(2)} ms (Conversion: ${conversionDurationMs.toFixed(2)} ms, Transcription: ${transcriptionDurationMs.toFixed(2)} ms).`);
 
 				}
-				// --- TTS Execution Path ---
 				else if (operation === 'tts') {
-					const voice = this.getNodeParameter('voice', itemIndex, undefined) as string | undefined; // Optional voice
-					const outputFieldName = this.getNodeParameter('outputFieldName', itemIndex) as string; // Use TTS output field
+					const voice = this.getNodeParameter('voice', itemIndex, undefined) as string | undefined; // Optional
+					const outputFieldName = this.getNodeParameter('outputFieldNameTts', itemIndex) as string; // Use TTS output field
 					const textToSpeak = this.getNodeParameter('inputText', itemIndex) as string;
-					if (typeof textToSpeak !== 'string' || textToSpeak.trim().length === 0) {
-						throw new NodeOperationError(this.getNode(), `TTS: Input text from parameter "${textToSpeak}" is missing or empty.`, { itemIndex });
-					}
-					if(voice) logger.debug(`${logPrefix} TTS: Using voice: ${voice}`);
 
-					// --- Wyoming Synthesis ---
+					if (typeof textToSpeak !== 'string' || textToSpeak.trim().length === 0) {
+						throw new NodeOperationError(this.getNode(), `TTS: Input text is missing or empty. Please provide text in the 'Input Text Field' parameter.`, { itemIndex });
+					}
+					if (voice) logger.debug(`${logPrefix} TTS: Using voice: ${voice}`);
+                    else logger.debug(`${logPrefix} TTS: No voice specified, using server default.`);
+
 					let synthesisDurationMs = 0;
 					logger.debug(`${logPrefix} TTS: Starting synthesis process for text: "${textToSpeak.substring(0, 50)}${textToSpeak.length > 50 ? '...' : ''}"`);
 					const synthesisStartTime = performance.now();
-					const rawPcmAudioBuffer = await _synthesizeAudio(this, itemIndex, serverAddress, textToSpeak, voice, timeoutMs);
+					// Pass `this` (IExecuteFunctions) as execContext
+					const rawPcmAudioBuffer = await _synthesizeAudio(this, itemIndex, serverAddress, textToSpeak, voice || undefined, timeoutMs); // Pass undefined if empty string
 					const synthesisEndTime = performance.now();
 					synthesisDurationMs = synthesisEndTime - synthesisStartTime;
 					logger.info(`${logPrefix} TTS: Wyoming synthesis took ${synthesisDurationMs.toFixed(2)} ms. Received ${rawPcmAudioBuffer.length} bytes of PCM data.`);
 
 					if (rawPcmAudioBuffer.length === 0) {
-						// Don't throw an error, but maybe warn and return item without audio? Or handle based on a setting?
 						logger.warn(`${logPrefix} TTS: Synthesis resulted in empty audio data. Returning item without audio in field "${outputFieldName}".`);
-						// Create item without the binary data
                          newItem = { json: JSON.parse(JSON.stringify(item.json)), pairedItem: { item: itemIndex } };
 					} else {
-						// --- Add WAV Header ---
 						const wavBuffer = _addWavHeader(rawPcmAudioBuffer, SAMPLE_RATE, SAMPLE_WIDTH, SAMPLE_CHANNELS);
-						logger.info(`${logPrefix} TTS: Added WAV header. Total WAV size: ${wavBuffer.length} bytes.`);
+						logger.debug(`${logPrefix} TTS: Added WAV header. Total WAV size: ${wavBuffer.length} bytes.`);
 
-						// --- Prepare TTS Output ---
-						const outputFileName = `tts_output_${itemIndex}.wav`; // Generate a filename
+						const outputFileName = `tts_output_${itemIndex}.wav`;
 						const binaryOutputData: IBinaryData = await this.helpers.prepareBinaryData(wavBuffer, outputFileName, DEFAULT_TTS_OUTPUT_MIME_TYPE);
 
-						// Create a new item structure for the output, preserving input JSON but adding binary data
 						newItem = {
-							json: JSON.parse(JSON.stringify(item.json)), // Keep original JSON data
-							binary: { // Add the new binary data
+							json: JSON.parse(JSON.stringify(item.json)),
+							binary: {
 								[outputFieldName]: binaryOutputData,
 							},
 							pairedItem: { item: itemIndex },
@@ -979,59 +890,47 @@ export class WyomingNode implements INodeType {
 					logger.info(`${logPrefix} TTS: Successfully processed item in ${(overallEndTime - overallStartTime).toFixed(2)} ms (Synthesis: ${synthesisDurationMs.toFixed(2)} ms).`);
 				}
 
-				// Add the successfully processed item to the return data
                 if (newItem) {
 				    returnData.push(newItem);
                 } else {
-                    // This case should ideally not happen if logic above is correct
                     logger.warn(`${logPrefix} No output item was generated for an unknown reason. Skipping item.`);
-                    // Optionally push original item if continue on fail?
                 }
 
 			} catch (error: any) {
-				// --- Refined Error Handling (Common for STT/TTS) ---
 				const errorMessage = error.message || String(error);
-				const originalCode = (error as any).originalCode; // Socket error code
-				const isSpawnError = (error as any).isSpawnError; // FFmpeg spawn error (STT only)
-				const isConfigError = (error as any).isConfigurationError; // Bad address/port
+				const originalCode = (error as any).originalCode;
+				const isSpawnError = (error as any).isSpawnError;
+				const isConfigError = (error as any).isConfigurationError;
 				logger.error(`${logPrefix} Error processing item (${operation.toUpperCase()}): ${errorMessage}`, error);
 				const overallEndTime = performance.now();
-				logger.debug(`${logPrefix} Failed processing item after ${(overallEndTime - overallStartTime).toFixed(2)} ms.`);
+				logger.info(`${logPrefix} Failed processing item after ${(overallEndTime - overallStartTime).toFixed(2)} ms.`);
 
-				// Determine if the error is critical (stop workflow regardless of continueOnFail)
-				// Critical: Cannot connect, cannot find ffmpeg
 				const isCriticalNetworkError = ['ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'EAI_AGAIN'].includes(originalCode) || isConfigError;
 				const isCriticalError = isCriticalNetworkError || isSpawnError;
 
 				if (isCriticalError) {
 					logger.error(`${logPrefix} Critical error detected (${originalCode || (isSpawnError ? 'ffmpeg spawn failed' : 'config error')}). Stopping workflow execution.`);
-					// Ensure the error is thrown correctly to stop the workflow
 					if (error instanceof NodeOperationError) throw error;
 					throw new NodeOperationError(this.getNode(), error as Error, { itemIndex, description: errorMessage });
 				} else {
-					// For non-critical errors (timeouts, server errors, ffmpeg *conversion* issues, synthesis errors, etc.), respect "Continue on Fail"
 					if (this.continueOnFail()) {
 						logger.warn(`${logPrefix} Non-critical error occurred. continueOnFail is true. Recording error and continuing workflow.`);
-						// Ensure error is an instance of NodeOperationError before attaching to item
 						const n8nError = error instanceof NodeOperationError ? error : new NodeOperationError(this.getNode(), error as Error, { itemIndex, description: errorMessage });
-						// Return the original item with the error attached
 						const errorItem: INodeExecutionData = {
-							json: item.json, // Keep original JSON
-							binary: item.binary, // Keep original binary data (if any)
-							error: n8nError, // Attach the error object
+							json: item.json,
+							binary: item.binary,
+							error: n8nError,
 							pairedItem: { item: itemIndex },
 						};
 						returnData.push(errorItem);
 					} else {
-						// If continueOnFail is false, stop the workflow by re-throwing
 						logger.warn(`${logPrefix} Non-critical error occurred. continueOnFail is false. Stopping workflow execution.`);
 						if (error instanceof NodeOperationError) throw error;
 						throw new NodeOperationError(this.getNode(), error as Error, { itemIndex, description: errorMessage });
 					}
 				}
-				// --- End of Refined Error Handling ---
 			}
-		} // End of loop over items
+		}
 
 		logger.debug(`${NODE_NAME_LOG_PREFIX} Finished execution.`);
 		return [returnData];
